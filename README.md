@@ -37,17 +37,24 @@ Jangan gunakan modal live sampai hasil forward test/demo sesuai dengan asumsi ba
 - Logging live signal MT5 dalam mode dry-run dan eksekusi order dengan guard.
 - Persistent live state untuk cooldown dan duplicate-order protection.
 - Laporan data quality dan integritas artifact.
+- Terminal live dashboard berbasis Rich untuk memantau status, market, signal, posisi, dan event log.
 
 ## Live Dashboard
 
-![TradingBotML live dashboard](docs/images/live-dashboard-preview.svg)
-
 Dashboard terminal menampilkan status koneksi MT5, akun, market, trend multi-timeframe, sinyal ML, posisi terbuka, dan event log live dalam satu tampilan.
+
+![TradingBotML live dashboard](docs/live_dashboard_screenshot.png)
 
 Jalankan dashboard live dry-run:
 
 ```powershell
 python src/live_mt5.py --all --dashboard
+```
+
+Fokus ke symbol tertentu:
+
+```powershell
+python src/live_mt5.py --symbol XAUUSD --dashboard --dashboard-symbol XAUUSD
 ```
 
 ## Struktur Repository
@@ -64,6 +71,7 @@ src/
   walk_forward_threshold.py   Threshold search
   weekly_retrain.py           Retraining window terbaru dan deployment gate
   live_mt5.py                 Live dry-run / execution runner MT5
+  live_dashboard.py           Rich terminal dashboard untuk live monitoring
   production.py               Helper validasi artifact dan production gate
 tests/
   test_core.py                Unit test dan regression test

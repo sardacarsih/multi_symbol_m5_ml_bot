@@ -20,7 +20,8 @@ from features import add_features
 from labeling import label_diagnostics, atr_barrier_labels
 from label_selection_experiment import LabelVariant, label_variant_frame, rank_results
 from analyze_live_signals import session_from_hour
-from live_mt5 import decide_live_signal, evaluate_symbol, load_artifacts, order_dedupe_key, predict_proba_model, validate_trade_account
+from live_dashboard import ASCII_BANNER, LiveSnapshot, RichDashboard, account_snapshot, positions_snapshot, trend_snapshot
+from live_mt5 import build_parser, decide_live_signal, evaluate_symbol, load_artifacts, order_dedupe_key, predict_proba_model, validate_trade_account
 from risk import calculate_atr_sl_tp, check_spread_filter, normalize_lot
 from strategy_filters import session_allowed, simulate_exit
 from train import sample_weights
@@ -454,6 +455,70 @@ class CoreBehaviorTests(unittest.TestCase):
             validate_trade_account(Mt5(), allow_real=False)
         validate_trade_account(Mt5(), allow_real=True)
 
+    def test_live_dashboard_helpers_build_account_positions_and_trend(self):
+        class Account:
+            balance = 914.18
+            equity = 913.50
+            margin_free = 900.0
+            margin_level = 120.5
+
+        class Position:
+            magic = 20260605
+            symbol = "XAUUSD"
+            ticket = 123
+            type = 0
+            volume = 0.02
+            price_open = 4320.25
+            sl = 4310.0
+            tp = 4340.0
+            profit = 4.5
+
+        class Mt5:
+            def account_info(self):
+                return Account()
+
+            def positions_get(self):
+                return [Position()]
+
+        account = account_snapshot(Mt5())
+        positions = positions_snapshot(Mt5(), "XAUUSD", 20260605)
+        trend = trend_snapshot(pd.Series({"close": 101.0, "ema_20": 100.0, "m15_close_to_ema20": 0.01, "h1_close_to_ema20": -0.01}))
+
+        self.assertEqual(account.balance, 914.18)
+        self.assertEqual(positions[0].side, "BUY")
+        self.assertEqual(positions[0].lots, "0.02")
+        self.assertEqual(trend["M5"], "UP")
+        self.assertEqual(trend["M15"], "UP")
+        self.assertEqual(trend["H1"], "DOWN")
+        self.assertEqual(trend["H4"], "N/A")
+
+    def test_live_parser_accepts_dashboard_flags(self):
+        args = build_parser().parse_args(
+            ["--symbol", "XAUUSD", "--dashboard", "--dashboard-symbol", "XAUUSD", "--dashboard-log-limit", "12"]
+        )
+
+        self.assertTrue(args.dashboard)
+        self.assertEqual(args.dashboard_symbol, "XAUUSD")
+        self.assertEqual(args.dashboard_log_limit, 12)
+
+    def test_live_dashboard_header_contains_ascii_banner(self):
+        dashboard = RichDashboard("XAUUSD", ["XAUUSD"])
+        snapshot = LiveSnapshot(
+            symbol="XAUUSD",
+            mt5_symbol="XAUUSD",
+            mode="DRY-RUN",
+            strategy="ML",
+            htf="ON",
+            connected=True,
+            heartbeat="OK",
+            trade_allowed="NO",
+            updated="14:05:00",
+        )
+        header = dashboard._header(snapshot)
+
+        self.assertIn(ASCII_BANNER.splitlines()[0], str(header.renderable))
+        self.assertIn("[XAUUSD M5 | Machine Learning Live Engine]", str(header.renderable))
+
     def test_disabled_symbol_does_not_send_order(self):
         class Info:
             volume_min = 0.01
@@ -493,10 +558,83 @@ class CoreBehaviorTests(unittest.TestCase):
              patch("live_mt5.add_features", return_value=features), \
              patch("live_mt5.append_csv_row") as append_row, \
              patch("live_mt5.send_order") as send_order:
-            evaluate_symbol(Mt5(), "XAUUSD", trade=True)
+            snapshot = evaluate_symbol(Mt5(), "XAUUSD", trade=True)
 
         self.assertFalse(send_order.called)
         self.assertEqual(append_row.call_args.args[1]["reason"], "SYMBOL_LIVE_DISABLED")
+        self.assertEqual(snapshot.signal.side, "BUY")
+        self.assertEqual(snapshot.signal.reason, "SYMBOL_LIVE_DISABLED")
+        self.assertEqual(snapshot.market.ask, 101.0)
+        self.assertEqual(snapshot.account.balance, None)
+
+    def test_live_duplicate_order_guard_uses_defined_side_and_returns_snapshot(self):
+        class Info:
+            volume_min = 0.01
+            volume_max = 1.0
+            volume_step = 0.01
+            trade_tick_value = 1.0
+            trade_tick_size = 0.01
+            trade_stops_level = 0
+            point = 0.01
+
+        class Tick:
+            ask = 101.0
+            bid = 100.0
+
+        class Mt5:
+            def symbol_info(self, _symbol):
+                return Info()
+
+            def symbol_info_tick(self, _symbol):
+                return Tick()
+
+            def positions_get(self):
+                return []
+
+            def history_deals_get(self, _start, _end):
+                return []
+
+        feature_time = pd.Timestamp("2026-06-06 03:50:00")
+        features = pd.DataFrame(
+            [{
+                "time": feature_time,
+                "close": 100.0,
+                "atr_14": 2.0,
+                "spread": 1.0,
+                "spread_points": 100.0,
+                "spread_to_atr": 0.01,
+                "is_london_session": 1,
+                "ema_20": 99.0,
+            }]
+        )
+        side_model = {
+            "side_training_mode": "separate",
+            "models": {
+                "BUY": DummyModel([0.2, 0.8]),
+                "SELL": DummyModel([0.9, 0.1]),
+            },
+        }
+        from config import SYMBOLS as CONFIG_SYMBOLS
+        live_symbols = {key: value.copy() for key, value in CONFIG_SYMBOLS.items()}
+        live_symbols["XAUUSD"]["enabled_for_live"] = True
+        dedupe_key = order_dedupe_key("XAUUSD", "BUY", feature_time, "unknown")
+
+        with patch("live_mt5.ensure_symbol_visible"), \
+             patch("live_mt5.SYMBOLS", live_symbols), \
+             patch("live_mt5.load_artifacts", return_value=(side_model, ["close", "atr_14", "spread_to_atr"], {"buy_threshold": 0.55, "sell_threshold": 0.55, "eligible": True, "_live_meta": {"gate_status": "passed"}})), \
+             patch("live_mt5.fetch_recent_candles", return_value=pd.DataFrame({"time": [feature_time], "close": [100.0]})), \
+             patch("live_mt5.add_features", return_value=features), \
+             patch("live_mt5.load_live_state", return_value={"last_orders": {dedupe_key: "2026-06-06T03:50:00"}, "daily": {}}), \
+             patch("live_mt5.append_csv_row") as append_row, \
+             patch("live_mt5.send_order") as send_order:
+            snapshot = evaluate_symbol(Mt5(), "XAUUSD", trade=True)
+
+        self.assertFalse(send_order.called)
+        self.assertEqual(append_row.call_args.args[1]["reason"], "DUPLICATE_ORDER_GUARD")
+        self.assertEqual(snapshot.signal.side, "BUY")
+        self.assertEqual(snapshot.signal.reason, "DUPLICATE_ORDER_GUARD")
+        self.assertAlmostEqual(snapshot.signal.confidence, 0.8)
+        self.assertEqual(snapshot.trend["M5"], "UP")
 
     def test_live_regime_filter_blocks_order(self):
         class Info:

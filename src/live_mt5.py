@@ -33,11 +33,19 @@ from risk import (
     check_stop_level,
     normalize_lot,
 )
-from symbols import parse_symbol_args, resolve_symbols
+from symbols import parse_symbol_args, resolve_symbols, validate_symbol
 from strategy_filters import session_allowed
 from threshold_search import decide_signal
 from utils import append_csv_row, get_closed_candles_only, load_json, load_model, setup_logger, symbol_to_filename
 from production import canonical_meta_failures
+from live_dashboard import (
+    LiveSnapshot,
+    MarketSnapshot,
+    SignalSnapshot,
+    account_snapshot,
+    positions_snapshot,
+    trend_snapshot,
+)
 
 LOGGER = setup_logger("live_mt5")
 LAST_CLOSE_INDEX: dict[str, int] = {}
@@ -332,7 +340,7 @@ def validate_trade_account(mt5, allow_real: bool = False) -> None:
         raise RuntimeError("MT5 account trade_expert is False; enable algo trading/expert advisors")
 
 
-def evaluate_symbol(mt5, symbol: str, trade: bool) -> None:
+def evaluate_symbol(mt5, symbol: str, trade: bool) -> LiveSnapshot:
     cfg = SYMBOLS[symbol]
     mt5_symbol = cfg["mt5_symbol"]
     ensure_symbol_visible(mt5, symbol, mt5_symbol)
@@ -354,6 +362,7 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> None:
     buy_threshold = float(thresholds.get("buy_threshold", cfg["buy_threshold"]))
     sell_threshold = float(thresholds.get("sell_threshold", cfg["sell_threshold"]))
     signal = decide_live_signal(float(proba[1]), float(proba[2]), thresholds, cfg)
+    side = "BUY" if signal == 1 else "SELL" if signal == 2 else "NO_TRADE"
     open_symbol, open_total = open_positions(mt5, mt5_symbol)
     reason = "NO_TRADE"
 
@@ -400,7 +409,6 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> None:
     if can_trade:
         reason = "DRY_RUN" if not trade else "READY"
 
-    side = "BUY" if signal == 1 else "SELL" if signal == 2 else "NO_TRADE"
     price = float(tick.ask if signal == 1 else tick.bid) if tick is not None and signal else float(latest["close"])
     levels = calculate_atr_sl_tp(price, float(latest["atr_14"]), side if side != "NO_TRADE" else "BUY", cfg["live_sl_atr_mult"], cfg["live_tp_atr_mult"])
     lot = calculate_lot(mt5, cfg, info, signal, price, levels.sl_distance) if signal else 0.0
@@ -409,6 +417,53 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> None:
         total_risk = open_bot_risk_amount(mt5) + new_trade_risk_amount(info, lot, levels.sl_distance)
         if account is None or total_risk > account.balance * MAX_TOTAL_RISK:
             can_trade, reason = False, "TOTAL_RISK_LIMIT"
+
+    daily = daily_state_for_symbol(state, symbol)
+    account = account_snapshot(mt5)
+    account.daily_pnl = float(daily.get("realized_pnl", 0.0))
+    spread_points = latest.get("spread_points", None)
+    if spread_points is None:
+        point = getattr(info, "point", 0.0) if info is not None else 0.0
+        spread_points = spread / point if point else None
+    confidence = float(proba[signal]) if signal > 0 else float(max(proba[1], proba[2]))
+    snapshot = LiveSnapshot(
+        symbol=symbol,
+        mt5_symbol=mt5_symbol,
+        mode="LIVE" if trade else "DRY-RUN",
+        strategy="ML",
+        htf="ON" if any(name.startswith(("m15_", "h1_")) for name in latest.index) else "OFF",
+        connected=True,
+        heartbeat="OK",
+        trade_allowed="YES" if can_trade else "NO",
+        updated=datetime.now().strftime("%H:%M:%S"),
+        open_positions_symbol=open_symbol,
+        open_positions_total=open_total,
+        account=account,
+        market=MarketSnapshot(
+            bid=float(getattr(tick, "bid", 0.0)) if tick is not None else None,
+            ask=float(getattr(tick, "ask", 0.0)) if tick is not None else None,
+            spread=spread,
+            spread_points=float(spread_points) if spread_points is not None else None,
+            atr=float(latest["atr_14"]),
+            last_candle_time=str(feature_time),
+        ),
+        signal=SignalSnapshot(
+            side=side,
+            confidence=confidence,
+            prob_buy=float(proba[1]),
+            prob_sell=float(proba[2]),
+            reason=reason,
+            feature_time=str(feature_time),
+            timeframe=cfg["timeframe"],
+            lot=lot,
+            sl=levels.sl,
+            tp=levels.tp,
+            model_version=model_version,
+            gate_status=live_meta.get("gate_status", "missing"),
+        ),
+        positions=positions_snapshot(mt5, mt5_symbol, MAGIC_NUMBER),
+        trend=trend_snapshot(latest),
+    )
 
     append_csv_row(
         LOGS_DIR / "live_signals.csv",
@@ -437,14 +492,18 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> None:
 
     if not can_trade or not trade:
         LOGGER.info("%s signal=%s reason=%s", symbol, side, reason)
-        return
+        return snapshot
     if not check_stop_level(info, price, levels.sl, levels.tp):
         LOGGER.info("%s skipped: STOP_LEVEL", symbol)
-        return
+        snapshot.signal.reason = "STOP_LEVEL"
+        snapshot.trade_allowed = "NO"
+        return snapshot
     margin_ok, _ = check_margin(mt5, order_type(mt5, signal), mt5_symbol, lot, price)
     if not margin_ok:
         LOGGER.info("%s skipped: MARGIN", symbol)
-        return
+        snapshot.signal.reason = "MARGIN"
+        snapshot.trade_allowed = "NO"
+        return snapshot
     result = send_order(mt5, symbol, signal, lot, price, levels.sl, levels.tp)
     LAST_CLOSE_INDEX[symbol] = current_index
     record_order_state(state, symbol, side, feature_time, model_version)
@@ -464,21 +523,66 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> None:
             "ticket": getattr(result, "order", None),
         },
     )
+    return snapshot
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run MT5 multi-symbol live bot. Default is dry-run.")
     parse_symbol_args(parser)
     parser.add_argument("--trade", action="store_true", help="Send real market orders. Without this flag, only signals are logged.")
     parser.add_argument("--allow-real-account", action="store_true", help="Allow trading on a non-demo account. Strongly discouraged.")
     parser.add_argument("--once", action="store_true", help="Run one evaluation pass and exit.")
     parser.add_argument("--sleep-seconds", type=int, default=60, help="Delay between live evaluation loops.")
+    parser.add_argument("--dashboard", action="store_true", help="Render a Rich live dashboard while evaluating symbols.")
+    parser.add_argument("--dashboard-symbol", help="Initial symbol focus for --dashboard. Must be in the selected symbol set.")
+    parser.add_argument("--dashboard-log-limit", type=int, default=100, help="Maximum in-memory dashboard events per panel.")
+    return parser
+
+
+def run_dashboard_loop(mt5, selected_symbols: list[str], trade: bool, once: bool, sleep_seconds: int, focus_symbol: str, log_limit: int) -> None:
+    from rich.live import Live
+    from live_dashboard import RichDashboard
+
+    dashboard = RichDashboard(focus_symbol=focus_symbol, symbols=selected_symbols, log_limit=max(log_limit, 1))
+    with Live(dashboard.render(), refresh_per_second=4, screen=True) as live:
+        while True:
+            for symbol in selected_symbols:
+                try:
+                    dashboard.set_snapshot(evaluate_symbol(mt5, symbol, trade))
+                except Exception as exc:
+                    LOGGER.exception("%s live evaluation failed: %s", symbol, exc)
+                    dashboard.add_error(symbol, str(exc))
+                live.update(dashboard.render())
+            if once:
+                break
+            time.sleep(max(sleep_seconds, 1))
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     mt5 = connect_mt5()
     try:
         if args.trade:
             validate_trade_account(mt5, allow_real=args.allow_real_account)
         selected_symbols = resolve_symbols(args)
+        if args.dashboard_symbol:
+            focus_symbol = validate_symbol(args.dashboard_symbol)
+            if focus_symbol not in selected_symbols:
+                parser.error("--dashboard-symbol must be included in --symbol/--symbols/--all selection")
+        else:
+            focus_symbol = selected_symbols[0]
+        if args.dashboard:
+            run_dashboard_loop(
+                mt5,
+                selected_symbols,
+                args.trade,
+                args.once,
+                args.sleep_seconds,
+                focus_symbol,
+                args.dashboard_log_limit,
+            )
+            return
         while True:
             for symbol in selected_symbols:
                 try:

@@ -8,3 +8,4 @@ matplotlib
 ta
 python-dotenv
 optuna
+rich
