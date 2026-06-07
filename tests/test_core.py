@@ -18,6 +18,7 @@ from calibration_utils import calibrate_prefit_classifier
 from backtest_diagnostics import build_threshold_fingerprint, signal_diagnostics, threshold_fingerprint_status
 from features import add_features
 from labeling import label_diagnostics, atr_barrier_labels
+from label_selection_experiment import LabelVariant, label_variant_frame, rank_results
 from analyze_live_signals import session_from_hour
 from live_mt5 import decide_live_signal, evaluate_symbol, load_artifacts, order_dedupe_key, predict_proba_model, validate_trade_account
 from risk import calculate_atr_sl_tp, check_spread_filter, normalize_lot
@@ -333,6 +334,7 @@ class CoreBehaviorTests(unittest.TestCase):
                 "close_to_ema20": [0.01, 0.02, 0.03],
                 "ema20_slope": [0.001, 0.002, 0.003],
                 "dist_from_high_24": [-1.0, -0.5, -0.2],
+                "dist_from_high_24_atr": [-1.0, -0.5, -0.2],
                 "atr_14_to_28": [1.1, 1.2, 1.3],
             }
         )
@@ -345,9 +347,10 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertNotIn("ema_20", columns)
         self.assertNotIn("highest_high_24", columns)
         self.assertNotIn("lowest_low_24", columns)
+        self.assertNotIn("dist_from_high_24", columns)
         self.assertIn("close_to_ema20", columns)
         self.assertIn("ema20_slope", columns)
-        self.assertIn("dist_from_high_24", columns)
+        self.assertIn("dist_from_high_24_atr", columns)
         self.assertIn("atr_14_to_28", columns)
 
     def test_feature_selection_core_sets(self):
@@ -358,6 +361,7 @@ class CoreBehaviorTests(unittest.TestCase):
         df = pd.DataFrame({feature: [1.0, 2.0] for feature in CORE30_FEATURES})
         selected_20, skipped_20, requested_20 = select_features("core20", df, CORE30_FEATURES, "XAUUSD")
         selected_30, skipped_30, requested_30 = select_features("core30", df, CORE30_FEATURES, "XAUUSD")
+        selected_robust, skipped_robust, requested_robust = select_features("robust70", df, CORE30_FEATURES, "XAUUSD")
 
         self.assertEqual(selected_20, CORE20_FEATURES)
         self.assertEqual(requested_20, CORE20_FEATURES)
@@ -365,6 +369,9 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertEqual(selected_30, CORE30_FEATURES)
         self.assertEqual(requested_30, CORE30_FEATURES)
         self.assertEqual(skipped_30, [])
+        self.assertEqual(selected_robust, CORE30_FEATURES)
+        self.assertEqual(requested_robust, CORE30_FEATURES)
+        self.assertEqual(skipped_robust, [])
 
     def test_filter_valid_features_records_missing_and_invalid(self):
         from feature_selection_experiment import filter_valid_features
@@ -1082,6 +1089,39 @@ class CoreBehaviorTests(unittest.TestCase):
             float(ranked.loc[ranked["name"] == "stable_low_drawdown", "threshold_quality_score"].iloc[0]),
         )
 
+    def test_threshold_quality_flags_weak_low_confidence_thresholds(self):
+        candidates = pd.DataFrame(
+            [
+                {
+                    "name": "weak_low_confidence",
+                    "threshold": 0.42,
+                    "backtest_trades": 12,
+                    "backtest_profit_factor": 1.2,
+                    "backtest_net_profit": 0.3,
+                    "backtest_expected_value": 0.05,
+                    "backtest_max_drawdown": -0.2,
+                },
+                {
+                    "name": "strong_low_confidence",
+                    "threshold": 0.42,
+                    "backtest_trades": 24,
+                    "backtest_profit_factor": 1.6,
+                    "backtest_net_profit": 1.0,
+                    "backtest_expected_value": 0.10,
+                    "backtest_max_drawdown": -0.2,
+                },
+            ]
+        )
+
+        ranked = threshold_quality_columns(candidates, min_signals=10)
+
+        weak = ranked[ranked["name"] == "weak_low_confidence"].iloc[0]
+        strong = ranked[ranked["name"] == "strong_low_confidence"].iloc[0]
+        self.assertTrue(bool(weak["low_confidence_threshold"]))
+        self.assertFalse(bool(weak["strong_low_confidence_evidence"]))
+        self.assertEqual(weak["calibration_risk"], "low_confidence_threshold")
+        self.assertTrue(bool(strong["strong_low_confidence_evidence"]))
+
     def test_walk_forward_threshold_prefers_target_trade_frequency_with_quality_gate(self):
         rows = []
         proba = []
@@ -1495,7 +1535,67 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertIn("label_counts", diagnostics)
         self.assertIn("monthly_distribution", diagnostics)
         self.assertIn("ambiguous_barrier_count", diagnostics)
+        self.assertIn("label_entropy", diagnostics)
+        self.assertIn("execution_adjusted_label_agreement", diagnostics)
+        self.assertIn("side_expectancy", diagnostics)
         self.assertGreaterEqual(diagnostics["ambiguous_barrier_count"], 1)
+
+    def test_label_variant_frame_uses_custom_barrier_without_mutating_features(self):
+        source = pd.DataFrame(
+            [
+                {
+                    "time": pd.Timestamp("2026-01-01 00:00") + pd.Timedelta(minutes=5 * idx),
+                    "open": 100.0,
+                    "high": 101.5 if idx == 1 else 100.5,
+                    "low": 99.5,
+                    "close": 100.0,
+                    "atr_14": 1.0,
+                    "spread": 0.0,
+                }
+                for idx in range(5)
+            ]
+        )
+        variant = LabelVariant("unit", lookahead=3, tp_atr_mult=1.0, sl_atr_mult=1.0, spread_adjusted=False)
+
+        labeled, outcomes = label_variant_frame(source, "XAUUSD", variant)
+
+        self.assertEqual(len(labeled), len(source) - 3)
+        self.assertEqual(len(outcomes), len(labeled))
+        self.assertNotIn("label", source.columns)
+        self.assertIn("label", labeled.columns)
+        self.assertEqual(int(labeled["label"].iloc[0]), 1)
+
+    def test_label_variant_ranking_prefers_oos_and_label_quality(self):
+        ranked = rank_results(
+            [
+                {
+                    "name": "weak",
+                    "pct_no_trade": 0.8,
+                    "pct_buy": 0.1,
+                    "pct_sell": 0.1,
+                    "label_entropy": 0.6,
+                    "oos_profit_factor": 1.0,
+                    "oos_avg_pnl_per_trade": 0.0,
+                    "oos_max_drawdown": -1.0,
+                    "oos_net_profit": 0.1,
+                    "oos_total_trades": 50,
+                },
+                {
+                    "name": "strong",
+                    "pct_no_trade": 0.4,
+                    "pct_buy": 0.3,
+                    "pct_sell": 0.3,
+                    "label_entropy": 1.0,
+                    "oos_profit_factor": 1.5,
+                    "oos_avg_pnl_per_trade": 0.02,
+                    "oos_max_drawdown": -0.5,
+                    "oos_net_profit": 1.0,
+                    "oos_total_trades": 60,
+                },
+            ]
+        )
+
+        self.assertEqual(ranked.iloc[0]["name"], "strong")
 
     def test_enriched_features_are_numeric_and_finite(self):
         rows = []
@@ -1533,6 +1633,13 @@ class CoreBehaviorTests(unittest.TestCase):
             "m15_close_to_ema20",
             "h1_return_1",
             "h1_close_to_ema20",
+            "prev_day_high_dist_atr",
+            "prev_week_high_dist_atr",
+            "intraday_range_adr",
+            "vol_compression_release",
+            "is_london_killzone",
+            "liquidity_sweep_high_24",
+            "session_liquidity_stress",
         ]
 
         self.assertFalse(features.empty)

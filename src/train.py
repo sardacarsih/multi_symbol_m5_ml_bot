@@ -15,7 +15,26 @@ LOGGER = setup_logger("train")
 
 REDUNDANT_TRAIN_COLUMNS = {
     "point",
+    "tick_size",
+    "tick_value",
+    "spread",
+    "spread_points",
     "symbol_id",
+    "dist_from_high_24",
+    "dist_from_low_24",
+    "price_change_6",
+    "atr_14",
+    "atr_5",
+    "atr_28",
+    "volume_sma_12",
+    "volume_sma_24",
+    "body_size",
+    "upper_wick",
+    "lower_wick",
+    "candle_range",
+    "macd",
+    "macd_signal",
+    "rsi_21",
 }
 
 REDUNDANT_TRAIN_PREFIXES = (
@@ -24,6 +43,90 @@ REDUNDANT_TRAIN_PREFIXES = (
     "highest_high_",
     "lowest_low_",
 )
+
+SUSPECT_SHORT_HORIZON_PATTERN_COLUMNS = {
+    "doji",
+    "hammer",
+    "shooting_star",
+    "engulfing",
+    "consecutive_green",
+    "consecutive_red",
+    "rsi_price_divergence",
+}
+
+ROBUST_TRAIN_FEATURES = {
+    "hour",
+    "is_london_session",
+    "is_newyork_session",
+    "is_london_newyork_overlap",
+    "is_london_killzone",
+    "is_newyork_killzone",
+    "spread_to_atr",
+    "spread_rank_100",
+    "session_spread_stress",
+    "session_liquidity_stress",
+    "abnormal_spread",
+    "return_3",
+    "return_6",
+    "atr_ratio",
+    "atr_5_to_14",
+    "atr_14_to_28",
+    "vol_regime",
+    "vol_expansion",
+    "atr_rank_100",
+    "atr_rank_288",
+    "realized_vol_rank_100",
+    "vol_compression",
+    "vol_breakout_regime",
+    "vol_compression_release",
+    "rolling_std_24",
+    "close_to_ema20",
+    "close_to_ema50",
+    "ema20_slope",
+    "ema20_slope_atr",
+    "ema_alignment_score",
+    "adx_14",
+    "di_spread_14",
+    "trend_direction_strength",
+    "trend_range_regime",
+    "rsi_7",
+    "rsi_14",
+    "macd_hist",
+    "macd_hist_change_3",
+    "close_position_in_range_24",
+    "dist_from_high_24_atr",
+    "dist_from_low_24_atr",
+    "range_width_48_atr",
+    "breakout_high_24",
+    "breakout_low_24",
+    "prev_day_high_dist_atr",
+    "prev_day_low_dist_atr",
+    "prev_week_high_dist_atr",
+    "prev_week_low_dist_atr",
+    "intraday_range_adr",
+    "adr_14_atr",
+    "adr_expansion",
+    "swing_high_dist_atr",
+    "swing_low_dist_atr",
+    "market_structure_state",
+    "liquidity_sweep_high_24",
+    "liquidity_sweep_low_24",
+    "failed_breakout_high_24",
+    "failed_breakout_low_24",
+    "volume_ratio_12",
+    "volume_rank_100",
+    "volume_price_trend",
+    "dist_from_vwap",
+    "bb_position",
+    "m15_return_1",
+    "m15_close_to_ema20",
+    "m15_range_position_20",
+    "m15_atr_ratio",
+    "h1_return_1",
+    "h1_close_to_ema20",
+    "h1_range_position_20",
+    "h1_atr_ratio",
+}
 
 
 def load_labeled(symbol: str) -> pd.DataFrame:
@@ -44,6 +147,10 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
         if col in excluded or df[col].dtype == object:
             continue
         if col in REDUNDANT_TRAIN_COLUMNS or col.startswith(REDUNDANT_TRAIN_PREFIXES):
+            continue
+        if col in SUSPECT_SHORT_HORIZON_PATTERN_COLUMNS:
+            continue
+        if col not in ROBUST_TRAIN_FEATURES:
             continue
         if pd.api.types.is_numeric_dtype(df[col]):
             columns.append(col)

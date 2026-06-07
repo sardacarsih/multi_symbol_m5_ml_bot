@@ -10,6 +10,8 @@ LOGGER = setup_logger("walk_forward_threshold")
 ADAPTIVE_THRESHOLD_QUANTILES = (0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
 ADAPTIVE_THRESHOLD_FLOOR = 0.25
 FIXED_GRID_MIN_THRESHOLD = 0.55
+MIN_TRUSTED_DEPLOY_THRESHOLD = 0.50
+STRONG_LOW_CONFIDENCE_PROFIT_FACTOR = 1.50
 MIN_STABLE_THRESHOLD_TRADES = 10
 
 
@@ -425,6 +427,24 @@ def threshold_quality_columns(result_df: pd.DataFrame, min_signals: int) -> pd.D
         lambda trades: max(0.0, (stable_trade_floor - float(trades)) / stable_trade_floor)
     )
     ranked["drawdown_penalty"] = ranked["backtest_max_drawdown"].abs()
+    if "threshold" in ranked.columns:
+        ranked["min_side_threshold"] = ranked["threshold"].astype(float)
+    elif {"buy_threshold", "sell_threshold"}.issubset(ranked.columns):
+        ranked["min_side_threshold"] = ranked[["buy_threshold", "sell_threshold"]].min(axis=1).astype(float)
+    else:
+        ranked["min_side_threshold"] = 1.0
+    ranked["low_confidence_threshold"] = ranked["min_side_threshold"] < MIN_TRUSTED_DEPLOY_THRESHOLD
+    ranked["strong_low_confidence_evidence"] = (
+        (ranked["backtest_trades"] >= max(MIN_STABLE_THRESHOLD_TRADES, int(min_signals)) * 2)
+        & (ranked["backtest_profit_factor"] >= STRONG_LOW_CONFIDENCE_PROFIT_FACTOR)
+        & (ranked["backtest_net_profit"] > 0)
+        & (ranked["backtest_expected_value"] > 0)
+    )
+    ranked["calibration_risk"] = np.where(
+        ranked["low_confidence_threshold"] & ~ranked["strong_low_confidence_evidence"],
+        "low_confidence_threshold",
+        "",
+    )
     ranked["threshold_quality_score"] = (
         ranked["pf_dd_ratio"].clip(upper=10.0)
         + ranked["backtest_expected_value"].clip(lower=-10.0, upper=10.0)
@@ -614,6 +634,7 @@ def optimize_thresholds_wf(val_df: pd.DataFrame, proba: np.ndarray, cfg: dict) -
         (result_df["backtest_trades"] >= min_signals)
         & (result_df["backtest_profit_factor"] >= MIN_THRESHOLD_PROFIT_FACTOR)
         & (result_df["backtest_net_profit"] > 0)
+        & (~result_df["low_confidence_threshold"] | result_df["strong_low_confidence_evidence"])
     )
 
     # Prefer quality first; trade frequency is only a tie-breaker after profitable edge.
@@ -630,10 +651,11 @@ def optimize_thresholds_wf(val_df: pd.DataFrame, proba: np.ndarray, cfg: dict) -
             "backtest_profit_factor",
             "backtest_net_profit",
             "target_feasible",
+            "low_confidence_threshold",
             "trade_frequency_gap",
             "combined_precision",
         ],
-        ascending=[False, False, False, False, False, False, False, True, False, False, False, True, False],
+        ascending=[False, False, False, False, False, False, False, True, False, False, False, True, True, False],
     ).reset_index(drop=True)
 
     best_thresholds = result_df.iloc[0].to_dict()
@@ -745,6 +767,7 @@ def optimize_side_threshold_wf(val_df: pd.DataFrame, positive_proba: np.ndarray,
         (result_df["backtest_trades"] >= min_signals)
         & (result_df["backtest_profit_factor"] >= MIN_THRESHOLD_PROFIT_FACTOR)
         & (result_df["backtest_net_profit"] > 0)
+        & (~result_df["low_confidence_threshold"] | result_df["strong_low_confidence_evidence"])
     )
     result_df = result_df.sort_values(
         [

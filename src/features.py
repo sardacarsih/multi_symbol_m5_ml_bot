@@ -86,6 +86,98 @@ def add_higher_timeframe_context(result: pd.DataFrame, timeframe: str, prefix: s
             result[column] = merged[column].to_numpy()
 
 
+def add_daily_weekly_level_features(result: pd.DataFrame) -> None:
+    session_date = result["time"].dt.normalize()
+    daily = (
+        result.assign(session_date=session_date)
+        .groupby("session_date")
+        .agg(
+            day_high=("high", "max"),
+            day_low=("low", "min"),
+            day_close=("close", "last"),
+            day_range=("high", lambda values: float(values.max())),
+        )
+    )
+    daily["day_range"] = daily["day_high"] - daily["day_low"]
+    previous_daily = daily.shift(1).add_prefix("prev_")
+    merged_daily = pd.merge(
+        pd.DataFrame({"session_date": session_date}),
+        previous_daily.reset_index(),
+        on="session_date",
+        how="left",
+    )
+    safe_atr = result["atr_14"].replace(0, np.nan)
+    result["prev_day_high_dist_atr"] = (result["close"] - merged_daily["prev_day_high"].to_numpy()) / safe_atr
+    result["prev_day_low_dist_atr"] = (result["close"] - merged_daily["prev_day_low"].to_numpy()) / safe_atr
+    result["prev_day_close_dist_atr"] = (result["close"] - merged_daily["prev_day_close"].to_numpy()) / safe_atr
+
+    day_high_so_far = result.groupby(session_date)["high"].cummax()
+    day_low_so_far = result.groupby(session_date)["low"].cummin()
+    intraday_range = day_high_so_far - day_low_so_far
+    adr_14 = daily["day_range"].rolling(14, min_periods=5).mean().shift(1)
+    merged_adr = pd.merge(
+        pd.DataFrame({"session_date": session_date}),
+        adr_14.rename("adr_14").reset_index(),
+        on="session_date",
+        how="left",
+    )["adr_14"].to_numpy()
+    safe_adr = pd.Series(merged_adr, index=result.index).replace(0, np.nan)
+    result["intraday_range_atr"] = intraday_range / safe_atr
+    result["intraday_range_adr"] = intraday_range / safe_adr
+    result["adr_14_atr"] = safe_adr / safe_atr
+    result["adr_expansion"] = (result["intraday_range_adr"] > 1.0).astype(int)
+
+    week_start = result["time"].dt.to_period("W-MON").dt.start_time
+    weekly = (
+        result.assign(week_start=week_start)
+        .groupby("week_start")
+        .agg(week_high=("high", "max"), week_low=("low", "min"), week_close=("close", "last"))
+    )
+    previous_weekly = weekly.shift(1).add_prefix("prev_")
+    merged_weekly = pd.merge(
+        pd.DataFrame({"week_start": week_start}),
+        previous_weekly.reset_index(),
+        on="week_start",
+        how="left",
+    )
+    result["prev_week_high_dist_atr"] = (result["close"] - merged_weekly["prev_week_high"].to_numpy()) / safe_atr
+    result["prev_week_low_dist_atr"] = (result["close"] - merged_weekly["prev_week_low"].to_numpy()) / safe_atr
+    result["prev_week_close_dist_atr"] = (result["close"] - merged_weekly["prev_week_close"].to_numpy()) / safe_atr
+
+
+def add_market_structure_features(result: pd.DataFrame) -> None:
+    safe_atr = result["atr_14"].replace(0, np.nan)
+    swing_high = result["high"].rolling(5, center=True, min_periods=5).max().eq(result["high"])
+    swing_low = result["low"].rolling(5, center=True, min_periods=5).min().eq(result["low"])
+    confirmed_swing_high = result["high"].where(swing_high).shift(2).ffill()
+    confirmed_swing_low = result["low"].where(swing_low).shift(2).ffill()
+    previous_confirmed_high = confirmed_swing_high.shift(1)
+    previous_confirmed_low = confirmed_swing_low.shift(1)
+
+    result["swing_high_dist_atr"] = (result["close"] - confirmed_swing_high) / safe_atr
+    result["swing_low_dist_atr"] = (result["close"] - confirmed_swing_low) / safe_atr
+    result["market_structure_state"] = (
+        (confirmed_swing_high > previous_confirmed_high).astype(int)
+        - (confirmed_swing_low < previous_confirmed_low).astype(int)
+    )
+    result["liquidity_sweep_high_24"] = (
+        (result["high"] > result["highest_high_24"])
+        & (result["close"] < result["highest_high_24"])
+    ).astype(int)
+    result["liquidity_sweep_low_24"] = (
+        (result["low"] < result["lowest_low_24"])
+        & (result["close"] > result["lowest_low_24"])
+    ).astype(int)
+    result["failed_breakout_high_24"] = (
+        (result["breakout_high_24"].rolling(3, min_periods=1).max().shift(1) > 0)
+        & (result["close"] < result["highest_high_24"])
+    ).astype(int)
+    result["failed_breakout_low_24"] = (
+        (result["breakout_low_24"].rolling(3, min_periods=1).max().shift(1) > 0)
+        & (result["close"] > result["lowest_low_24"])
+    ).astype(int)
+
+
 def add_features(df: pd.DataFrame, symbol: str, include_symbol_features: bool = True) -> pd.DataFrame:
     result = df.copy()
     result["time"] = pd.to_datetime(result["time"])
@@ -160,6 +252,9 @@ def add_features(df: pd.DataFrame, symbol: str, include_symbol_features: bool = 
     result["is_london_session"] = result["hour"].between(7, 15).astype(int)
     result["is_newyork_session"] = result["hour"].between(13, 21).astype(int)
     result["is_london_newyork_overlap"] = result["hour"].between(13, 15).astype(int)
+    result["is_london_killzone"] = result["hour"].between(7, 10).astype(int)
+    result["is_newyork_killzone"] = result["hour"].between(13, 16).astype(int)
+    result["is_rollover_hour"] = result["hour"].between(21, 23).astype(int)
 
     result["spread_to_atr"] = result["spread"] / result["atr_14"].replace(0, np.nan)
 
@@ -179,22 +274,34 @@ def add_features(df: pd.DataFrame, symbol: str, include_symbol_features: bool = 
     result["realized_vol_rank_100"] = rolling_percentile(result["rolling_std_24"], 100)
     result["vol_compression"] = (result["atr_rank_100"] < 0.25).astype(int)
     result["vol_breakout_regime"] = ((result["atr_5_to_14"] > 1.1) & (result["atr_rank_100"] > 0.65)).astype(int)
+    result["vol_compression_release"] = (
+        (result["vol_compression"].shift(1).rolling(12, min_periods=1).max() > 0)
+        & (result["atr_5_to_14"] > 1.05)
+        & (result["atr_rank_100"] > 0.45)
+    ).astype(int)
 
     # --- Price Structure / Key Levels ---
+    structure_features = {}
     for window in [48, 96]:
-        result[f"highest_high_{window}"] = result["high"].rolling(window).max().shift(1)
-        result[f"lowest_low_{window}"] = result["low"].rolling(window).min().shift(1)
-        result[f"breakout_high_{window}"] = (result["close"] > result[f"highest_high_{window}"]).astype(int)
-        result[f"breakout_low_{window}"] = (result["close"] < result[f"lowest_low_{window}"]).astype(int)
+        highest_high = result["high"].rolling(window).max().shift(1)
+        lowest_low = result["low"].rolling(window).min().shift(1)
+        structure_features[f"highest_high_{window}"] = highest_high
+        structure_features[f"lowest_low_{window}"] = lowest_low
+        structure_features[f"breakout_high_{window}"] = (result["close"] > highest_high).astype(int)
+        structure_features[f"breakout_low_{window}"] = (result["close"] < lowest_low).astype(int)
+    result = pd.concat([result, pd.DataFrame(structure_features, index=result.index)], axis=1)
+
+    range_features = {}
     for w in [12, 24, 48, 96]:
         hh = result[f"highest_high_{w}"] if f"highest_high_{w}" in result.columns else result["high"].rolling(w).max().shift(1)
         ll = result[f"lowest_low_{w}"] if f"lowest_low_{w}" in result.columns else result["low"].rolling(w).min().shift(1)
         safe_range_w = (hh - ll).replace(0, np.nan)
-        result[f"close_position_in_range_{w}"] = (result["close"] - ll) / safe_range_w
-        result[f"dist_from_high_{w}_atr"] = (result["close"] - hh) / result["atr_14"].replace(0, np.nan)
-        result[f"dist_from_low_{w}_atr"] = (result["close"] - ll) / result["atr_14"].replace(0, np.nan)
-        result[f"range_width_{w}_atr"] = (hh - ll) / result["atr_14"].replace(0, np.nan)
-    result = result.copy()
+        safe_atr = result["atr_14"].replace(0, np.nan)
+        range_features[f"close_position_in_range_{w}"] = (result["close"] - ll) / safe_range_w
+        range_features[f"dist_from_high_{w}_atr"] = (result["close"] - hh) / safe_atr
+        range_features[f"dist_from_low_{w}_atr"] = (result["close"] - ll) / safe_atr
+        range_features[f"range_width_{w}_atr"] = (hh - ll) / safe_atr
+    result = pd.concat([result, pd.DataFrame(range_features, index=result.index)], axis=1).copy()
     result["dist_from_high_24"] = result["dist_from_high_24_atr"]
     result["dist_from_low_24"] = result["dist_from_low_24_atr"]
     result["breakout_high_retest_24"] = (
@@ -209,6 +316,8 @@ def add_features(df: pd.DataFrame, symbol: str, include_symbol_features: bool = 
         ((result["adx_14"] > 25) & (result["range_width_48_atr"] > result["range_width_48_atr"].rolling(100, min_periods=20).median())).astype(int)
         - ((result["adx_14"] < 18) & (result["range_width_48_atr"] < result["range_width_48_atr"].rolling(100, min_periods=20).median())).astype(int)
     )
+    add_daily_weekly_level_features(result)
+    add_market_structure_features(result)
     result = result.copy()
 
     # --- Momentum Divergence ---
@@ -284,6 +393,26 @@ def add_features(df: pd.DataFrame, symbol: str, include_symbol_features: bool = 
     result["spread_rank_100"] = rolling_percentile(result["spread_to_atr"], 100)
     result["spread_zscore_100"] = ((result["spread_to_atr"] - spread_mean_100) / spread_std_100.replace(0, np.nan)).fillna(0.0)
     result["abnormal_spread"] = ((result["spread_rank_100"] > 0.90) | (result["spread_zscore_100"] > 2.0)).astype(int)
+    session_spread_mean = result.groupby("hour")["spread_to_atr"].transform(lambda s: s.rolling(100, min_periods=20).mean())
+    result["session_spread_stress"] = (
+        result["spread_to_atr"] / session_spread_mean.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    result["session_liquidity_stress"] = ((result["session_spread_stress"] > 1.5) | (result["abnormal_spread"] > 0)).astype(int)
+
+    neutral_when_history_missing = [
+        "prev_day_high_dist_atr",
+        "prev_day_low_dist_atr",
+        "prev_day_close_dist_atr",
+        "intraday_range_adr",
+        "adr_14_atr",
+        "prev_week_high_dist_atr",
+        "prev_week_low_dist_atr",
+        "prev_week_close_dist_atr",
+        "swing_high_dist_atr",
+        "swing_low_dist_atr",
+    ]
+    for column in neutral_when_history_missing:
+        result[column] = result[column].fillna(0.0)
 
     add_higher_timeframe_context(result, "15min", "m15")
     add_higher_timeframe_context(result, "1h", "h1")

@@ -132,6 +132,31 @@ Hanya hasil yang lolos gate ketat yang boleh memperbarui metadata live canonical
 models/<SYMBOL>/live_model_meta.json
 ```
 
+## Optimization Workflow
+
+Untuk mencari labeling terbaik, feature set terbaik, walk-forward final, dan weekly retrain secara berurutan, gunakan workflow orkestrasi:
+
+```powershell
+python src/optimize_research_workflow.py --all --per-symbol --smoke --resume --skip-download --dry-run
+python src/optimize_research_workflow.py --all --per-symbol --trials 50 --resume --skip-download
+```
+
+Contoh khusus `XAUUSD` tanpa download data:
+
+```powershell
+python src/optimize_research_workflow.py --symbol XAUUSD --per-symbol --smoke --resume --skip-download --dry-run
+python src/optimize_research_workflow.py --symbol XAUUSD --per-symbol --trials 50 --resume --skip-download
+python src/optimize_research_workflow.py --symbol XAUUSD --stages summary
+```
+
+Report ranking ditulis ke:
+
+```text
+reports/optimization/optimization_summary.md
+```
+
+Panduan lengkap ada di `docs/OPTIMIZATION_WORKFLOW.md`.
+
 ## Weekly Retraining
 
 Jalankan retraining dengan window terbaru:

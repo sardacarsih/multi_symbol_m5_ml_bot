@@ -26,35 +26,35 @@ LOGGER = setup_logger("feature_selection_experiment")
 
 CORE30_FEATURES = [
     "hour",
-    "is_asia_session",
     "is_london_session",
     "is_newyork_session",
     "is_london_newyork_overlap",
+    "is_london_killzone",
+    "is_newyork_killzone",
     "spread_to_atr",
-    "atr_14",
+    "session_spread_stress",
     "atr_ratio",
     "atr_5_to_14",
     "atr_14_to_28",
     "vol_regime",
     "vol_expansion",
-    "atr_percentile_50",
-    "rolling_std_6",
-    "rolling_std_12",
+    "vol_compression_release",
     "rolling_std_24",
-    "return_1",
     "return_3",
     "return_6",
-    "return_12",
     "rsi_7",
-    "rsi_14",
-    "macd",
     "macd_hist",
     "macd_hist_change_3",
+    "ema_alignment_score",
+    "trend_direction_strength",
+    "close_position_in_range_24",
+    "range_width_48_atr",
+    "prev_day_high_dist_atr",
+    "prev_day_low_dist_atr",
+    "intraday_range_adr",
+    "market_structure_state",
+    "liquidity_sweep_high_24",
     "volume_ratio_12",
-    "volume_change_3",
-    "volume_price_trend",
-    "dist_from_vwap",
-    "bb_position",
 ]
 
 CORE20_FEATURES = [
@@ -62,22 +62,22 @@ CORE20_FEATURES = [
     "is_london_session",
     "is_newyork_session",
     "is_london_newyork_overlap",
+    "is_london_killzone",
     "spread_to_atr",
-    "atr_14",
     "atr_ratio",
     "atr_5_to_14",
     "atr_14_to_28",
     "vol_regime",
     "vol_expansion",
-    "rolling_std_12",
+    "vol_compression_release",
     "rolling_std_24",
     "return_3",
     "return_6",
-    "rsi_7",
-    "rsi_14",
     "macd_hist",
+    "ema_alignment_score",
+    "trend_direction_strength",
+    "close_position_in_range_24",
     "volume_ratio_12",
-    "volume_price_trend",
 ]
 
 
@@ -137,6 +137,8 @@ def select_features(
         requested = CORE20_FEATURES
     elif feature_set == "core30":
         requested = CORE30_FEATURES
+    elif feature_set == "robust70":
+        requested = valid_columns
     elif feature_set == "importance_top_n":
         if top_n is None or top_n <= 0:
             raise ValueError("--top-n must be a positive integer for importance_top_n")
@@ -498,7 +500,7 @@ def run_feature_selection_experiment(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run reduced-feature walk-forward experiments.")
     parse_symbol_args(parser)
-    parser.add_argument("--feature-set", choices=["core20", "core30", "importance_top_n"], default="core20")
+    parser.add_argument("--feature-set", choices=["core20", "core30", "robust70", "importance_top_n"], default="core20")
     parser.add_argument("--top-n", type=int, default=20, help="Number of importance-ranked features for importance_top_n")
     parser.add_argument("--trials", type=int, default=0, help="Optuna trials per cycle. 0 uses baseline parameters.")
     parser.add_argument("--resume", action="store_true", help="Load completed cycles and rerun partial cycles.")
