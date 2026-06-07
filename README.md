@@ -134,25 +134,71 @@ models/<SYMBOL>/live_model_meta.json
 
 ## Optimization Workflow
 
-Untuk mencari labeling terbaik, feature set terbaik, walk-forward final, dan weekly retrain secara berurutan, gunakan workflow orkestrasi:
+Gunakan `src/optimize_research_workflow.py` untuk menjalankan pencarian labeling terbaik, feature set terbaik, walk-forward final, weekly retrain, dan summary ranking.
+
+Default workflow:
+
+```text
+prepare -> label -> feature -> walk_forward -> retrain -> summary
+```
+
+### Quick Start Tanpa Download Data
+
+Gunakan `--skip-download` jika raw data lokal sudah tersedia di `data/raw/<SYMBOL>/`.
 
 ```powershell
 python src/optimize_research_workflow.py --all --per-symbol --smoke --resume --skip-download --dry-run
 python src/optimize_research_workflow.py --all --per-symbol --trials 50 --resume --skip-download
 ```
 
-Contoh khusus `XAUUSD` tanpa download data:
+Dengan `--skip-download`, stage `prepare` hanya menjalankan:
+
+```text
+features.py -> labeling.py
+```
+
+dan tidak memanggil `download_mt5_data.py`.
+
+### Contoh XAUUSD
 
 ```powershell
+# Lihat command tanpa menjalankan
 python src/optimize_research_workflow.py --symbol XAUUSD --per-symbol --smoke --resume --skip-download --dry-run
+
+# Full optimization memakai data lokal/cache
 python src/optimize_research_workflow.py --symbol XAUUSD --per-symbol --trials 50 --resume --skip-download
+
+# Buat summary dari report yang sudah ada
 python src/optimize_research_workflow.py --symbol XAUUSD --stages summary
 ```
+
+### Stage Terpisah
+
+```powershell
+# Regenerate feature dan label dari data lokal
+python src/optimize_research_workflow.py --symbol XAUUSD --stages prepare --skip-download
+
+# Cari labeling terbaik
+python src/optimize_research_workflow.py --symbol XAUUSD --stages label --trials 50 --resume
+
+# Cari feature set terbaik
+python src/optimize_research_workflow.py --symbol XAUUSD --stages feature --trials 50 --resume
+
+# Jalankan walk-forward final
+python src/optimize_research_workflow.py --symbol XAUUSD --stages walk_forward --trials 50 --resume
+
+# Weekly retrain tanpa update live_model_meta.json
+python src/optimize_research_workflow.py --symbol XAUUSD --stages retrain --trials 50
+```
+
+Tambahkan `--force-download` hanya jika ingin refresh data dari MT5. Jangan pakai `--force-download` jika ingin tetap memakai data lokal/cache.
 
 Report ranking ditulis ke:
 
 ```text
 reports/optimization/optimization_summary.md
+reports/optimization/optimization_summary.csv
+reports/optimization/optimization_summary.json
 ```
 
 Panduan lengkap ada di `docs/OPTIMIZATION_WORKFLOW.md`.
