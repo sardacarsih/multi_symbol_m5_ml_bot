@@ -43,7 +43,7 @@ Jangan gunakan modal live sampai hasil forward test/demo sesuai dengan asumsi ba
 
 Dashboard terminal menampilkan status koneksi MT5, akun, market, trend multi-timeframe, sinyal ML, posisi terbuka, dan event log live dalam satu tampilan.
 
-![TradingBotML live dashboard](docs/live_dashboard_screenshot.png)
+![TradingBotML live dashboard](docs/live_dashboard_screenshot.png?v=20260607-2)
 
 Jalankan dashboard live dry-run:
 
