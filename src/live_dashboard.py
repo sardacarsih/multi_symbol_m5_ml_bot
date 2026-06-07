@@ -33,6 +33,9 @@ class MarketSnapshot:
     spread_points: float | None = None
     atr: float | None = None
     last_candle_time: str = "N/A"
+    status: str = "UNKNOWN"
+    status_reason: str = "N/A"
+    last_candle_age: float | None = None
 
 
 @dataclass
@@ -171,6 +174,9 @@ def _format_number(value: Any, digits: int = 2, default: str = "N/A") -> str:
 
 
 class RichDashboard:
+    LOG_PANEL_LINES = 6
+    TRADE_PANEL_LINES = 18
+
     def __init__(self, focus_symbol: str, symbols: list[str], log_limit: int = 100):
         from rich.console import Console
 
@@ -188,10 +194,11 @@ class RichDashboard:
         self.focus_symbol = self.focus_symbol if self.focus_symbol in self.snapshots else snapshot.symbol
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.main_events.append(f"{timestamp} INFO {snapshot.symbol} {snapshot.signal.side} {snapshot.signal.reason}")
-        self.signal_events.append(
-            f"{timestamp} {snapshot.symbol} buy={_format_number(snapshot.signal.prob_buy, 3)} "
-            f"sell={_format_number(snapshot.signal.prob_sell, 3)}"
-        )
+        if snapshot.market.status == "OPEN":
+            self.signal_events.append(
+                f"{timestamp} {snapshot.symbol} buy={_format_number(snapshot.signal.prob_buy, 3)} "
+                f"sell={_format_number(snapshot.signal.prob_sell, 3)}"
+            )
         if snapshot.signal.reason in {"READY", "DRY_RUN"} and snapshot.signal.side != "NO_TRADE":
             self.trade_events.append(f"{timestamp} {snapshot.symbol} {snapshot.signal.side} lot={snapshot.signal.lot:.2f}")
         if snapshot.error:
@@ -204,8 +211,11 @@ class RichDashboard:
 
     def render(self):
         from rich.align import Align
+
+        return Align.center(self._layout(), vertical="top")
+
+    def _layout(self):
         from rich.layout import Layout
-        from rich.panel import Panel
 
         snapshot = self.snapshots.get(self.focus_symbol) or next(iter(self.snapshots.values()), None)
         layout = Layout()
@@ -216,12 +226,16 @@ class RichDashboard:
         )
         layout["body"].split_row(
             Layout(name="left", size=50),
-            Layout(self._positions(snapshot), ratio=2),
+            Layout(name="middle", ratio=2),
             Layout(name="right", size=50),
         )
         layout["left"].split_column(
             Layout(self._status(snapshot), ratio=1),
             Layout(self._account(snapshot), ratio=1),
+        )
+        layout["middle"].split_column(
+            Layout(self._positions(snapshot), name="positions", ratio=2),
+            Layout(self._events_panel("Trades", self.trade_events, "green", max_lines=self.TRADE_PANEL_LINES), name="trades", ratio=3),
         )
         layout["right"].split_column(
             Layout(self._market(snapshot), ratio=1),
@@ -229,12 +243,11 @@ class RichDashboard:
             Layout(self._signal(snapshot), ratio=1),
         )
         layout["logs"].split_row(
-            Layout(self._events_panel("Main", self.main_events, "blue")),
-            Layout(self._events_panel("Signals", self.signal_events, "yellow")),
-            Layout(self._events_panel("Trades", self.trade_events, "green")),
-            Layout(self._events_panel("Errors", self.error_events, "red")),
+            Layout(self._events_panel("Main", self.main_events, "blue", max_lines=self.LOG_PANEL_LINES)),
+            Layout(self._events_panel("Signals", self.signal_events, "yellow", max_lines=self.LOG_PANEL_LINES)),
+            Layout(self._events_panel("Errors", self.error_events, "red", max_lines=self.LOG_PANEL_LINES)),
         )
-        return Align.center(layout, vertical="top")
+        return layout
 
     def _header(self, snapshot: LiveSnapshot | None):
         from rich.align import Align
@@ -276,11 +289,14 @@ class RichDashboard:
     def _market(self, snapshot: LiveSnapshot | None):
         market = snapshot.market if snapshot else MarketSnapshot()
         rows = [
+            ("Status", market.status),
             ("Bid", _format_number(market.bid)),
             ("Ask", _format_number(market.ask)),
             ("Spread", _format_number(market.spread_points, 1, "-") + " pts"),
             ("Last Candle", market.last_candle_time),
+            ("Candle Age", _format_number(market.last_candle_age, 1, "-") + " min"),
             ("ATR", _format_number(market.atr)),
+            ("Reason", market.status_reason),
         ]
         return self._kv_panel("Market", rows, "bright_blue")
 
@@ -322,11 +338,14 @@ class RichDashboard:
             )
         return Panel(table, title="Open Positions", border_style="green")
 
-    def _events_panel(self, title: str, events: Deque[str], style: str):
+    def _events_panel(self, title: str, events: Deque[str], style: str, max_lines: int | None = None):
         from rich.panel import Panel
         from rich.text import Text
 
-        text = Text("\n".join(events) if events else "No events yet", style="white" if events else "dim")
+        visible_events = list(events)
+        if max_lines is not None:
+            visible_events = visible_events[-max(max_lines, 1) :]
+        text = Text("\n".join(visible_events) if visible_events else "No events yet", style="white" if visible_events else "dim")
         return Panel(text, title=title, border_style=style)
 
     def _kv_panel(self, title: str, rows: list[tuple[str, str]], style: str):

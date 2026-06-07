@@ -19,7 +19,7 @@ from symbols import parse_symbol_args, resolve_symbols
 from train import feature_columns, sample_weights
 from utils import ensure_dirs, save_json, save_model, setup_logger, symbol_to_filename
 from walk_forward_backtest import compute_oos_metrics, run_oos_backtest, save_equity_curve_wf
-from walk_forward_pipeline import generate_walk_forward_splits, is_cycle_complete, load_completed_cycle, run_tuning
+from walk_forward_pipeline import generate_walk_forward_splits, load_completed_cycle, run_tuning
 from walk_forward_threshold import optimize_thresholds_wf
 
 LOGGER = setup_logger("label_selection_experiment")
@@ -121,6 +121,23 @@ def safe_variant_name(name: str) -> str:
     return "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in name)
 
 
+def is_label_cycle_complete(cycle_model_dir: Path, cycle_report_dir: Path) -> bool:
+    required_model_files = [
+        "cycle_meta.json",
+        "model.joblib",
+        "feature_columns.json",
+        "best_threshold.json",
+    ]
+    required_report_files = ["oos_metrics.json", "oos_backtest.csv"]
+    for name in required_model_files:
+        if not (cycle_model_dir / name).exists():
+            return False
+    for name in required_report_files:
+        if not (cycle_report_dir / name).exists():
+            return False
+    return True
+
+
 def run_variant_walk_forward(
     symbol: str,
     features: pd.DataFrame,
@@ -164,7 +181,7 @@ def run_variant_walk_forward(
         cycle_model_dir = base_model_dir / f"cycle_{cycle:03d}"
         cycle_report_dir = base_report_dir / f"cycle_{cycle:03d}"
 
-        if resume and is_cycle_complete(cycle_model_dir, cycle_report_dir):
+        if resume and is_label_cycle_complete(cycle_model_dir, cycle_report_dir):
             LOGGER.info("%s %s %s cycle %03d already complete; loading artifacts", symbol, variant.name, feature_set, cycle)
             summary_row, oos_trades = load_completed_cycle(cycle_model_dir, cycle_report_dir, split)
             summary_rows.append(summary_row)

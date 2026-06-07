@@ -221,6 +221,42 @@ reports/optimization/optimization_summary.csv
 reports/optimization/optimization_summary.json
 ```
 
+### Parameter Penting untuk Dinyatakan Lolos
+
+Ada dua level evaluasi yang berbeda:
+
+- `optimization_summary` adalah ranking riset untuk memilih kandidat terbaik. Ini bukan izin deploy otomatis.
+- `deployment gate` adalah syarat ketat agar `models/<SYMBOL>/live_model_meta.json` boleh diperbarui dengan `gate_status="passed"`.
+
+Default deployment gate saat weekly retrain:
+
+| Parameter | Syarat default |
+|---|---:|
+| `total_trades` | `>= 30` |
+| `net_profit` | `> 0` |
+| `profit_factor` | `>= 1.25` |
+| `abs(max_drawdown)` | `<= 5.0` |
+| Data terbaru | tidak stale lebih dari `7` hari |
+
+Syarat tambahan agar deployment dinyatakan lolos:
+
+- Threshold harus eligible dan tidak memakai fallback.
+- Minimal ada satu `allowed_sides`.
+- Setiap allowed side harus punya trade cukup, net profit positif, profit factor cukup, expected value positif, drawdown aman, dan money PnL tersedia.
+- Artifact deployment lengkap dan model artifact bisa diload.
+
+Override gate saat weekly retrain:
+
+```powershell
+python src/weekly_retrain.py --symbol USTEC_X100 --trials 20 --min-oos-trades 30 --min-profit-factor 1.25 --max-drawdown-abs 5.0
+```
+
+Pada optimization workflow, `--deploy` hanya mengizinkan update metadata live jika deployment gate lolos:
+
+```powershell
+python src/optimize_research_workflow.py --symbol USTEC_X100 --per-symbol --stages retrain --trials 20 --deploy
+```
+
 Panduan lengkap ada di `docs/OPTIMIZATION_WORKFLOW.md`.
 
 ## Weekly Retraining

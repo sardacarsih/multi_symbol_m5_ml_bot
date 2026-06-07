@@ -1,6 +1,7 @@
 import argparse
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -50,6 +51,71 @@ from live_dashboard import (
 LOGGER = setup_logger("live_mt5")
 LAST_CLOSE_INDEX: dict[str, int] = {}
 LIVE_STATE_PATH = LOGS_DIR / "live_state.json"
+
+
+@dataclass(frozen=True)
+class MarketState:
+    status: str
+    reason: str
+    last_candle_age_minutes: float | None
+    tick_age_minutes: float | None
+
+
+def timeframe_minutes(timeframe: str) -> int:
+    if timeframe.startswith("M"):
+        return int(timeframe[1:])
+    if timeframe.startswith("H"):
+        return int(timeframe[1:]) * 60
+    raise ValueError(f"Unsupported timeframe for market state: {timeframe}")
+
+
+def _minutes_since(value, now: datetime) -> float | None:
+    if value is None:
+        return None
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert(None)
+    return max((pd.Timestamp(now) - timestamp).total_seconds() / 60.0, 0.0)
+
+
+def _tick_time(tick) -> datetime | None:
+    if tick is None:
+        return None
+    tick_msc = getattr(tick, "time_msc", None)
+    if tick_msc:
+        return datetime.fromtimestamp(float(tick_msc) / 1000.0)
+    tick_seconds = getattr(tick, "time", None)
+    if tick_seconds:
+        return datetime.fromtimestamp(float(tick_seconds))
+    return None
+
+
+def market_state(mt5, mt5_symbol: str, info, tick, feature_time, timeframe: str, now: datetime | None = None) -> MarketState:
+    now = now or datetime.now()
+    stale_after_minutes = max(3 * timeframe_minutes(timeframe), 30)
+    last_candle_age = _minutes_since(feature_time, now)
+    tick_age = _minutes_since(_tick_time(tick), now)
+
+    if tick is None:
+        return MarketState("UNKNOWN", "NO_TICK", last_candle_age, tick_age)
+    if info is None:
+        return MarketState("UNKNOWN", "NO_SYMBOL_INFO", last_candle_age, tick_age)
+
+    trade_mode = getattr(info, "trade_mode", None)
+    trade_mode_disabled = getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", None)
+    trade_mode_closeonly = getattr(mt5, "SYMBOL_TRADE_MODE_CLOSEONLY", None)
+    closed_trade_modes = {mode for mode in [trade_mode_disabled, trade_mode_closeonly] if mode is not None}
+    if closed_trade_modes and trade_mode in closed_trade_modes:
+        return MarketState("CLOSED", "MARKET_CLOSED", last_candle_age, tick_age)
+
+    if last_candle_age is None or last_candle_age > stale_after_minutes:
+        return MarketState("CLOSED", "MARKET_CLOSED", last_candle_age, tick_age)
+    if tick_age is not None and tick_age > stale_after_minutes:
+        return MarketState("CLOSED", "MARKET_CLOSED", last_candle_age, tick_age)
+
+    return MarketState("OPEN", "OK", last_candle_age, tick_age)
 
 
 def fetch_recent_candles(mt5, symbol: str, count: int = 300) -> pd.DataFrame:
@@ -353,6 +419,7 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> LiveSnapshot:
         raise RuntimeError(f"{symbol}: not enough candles to generate features")
     latest = features.iloc[-1]
     feature_time = latest.get("time", candles["time"].iloc[-1] if "time" in candles.columns and not candles.empty else datetime.now())
+    market = market_state(mt5, mt5_symbol, info, tick, feature_time, cfg["timeframe"])
     live_meta = thresholds.get("_live_meta", {})
     model_version = str(live_meta.get("deployment") or live_meta.get("cycle") or "unknown")
     missing = [col for col in columns if col not in features.columns]
@@ -368,6 +435,11 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> LiveSnapshot:
 
     spread = float(latest.get("spread", 0.0))
     spread_to_atr = float(latest["spread_to_atr"])
+    market_blocked = market.status != "OPEN"
+    if market_blocked:
+        signal = 0
+        side = "NO_TRADE"
+        reason = market.reason
     can_trade = signal > 0
     if can_trade and not bool(cfg.get("enabled_for_live", False)):
         can_trade, reason = False, "SYMBOL_LIVE_DISABLED"
@@ -425,7 +497,7 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> LiveSnapshot:
     if spread_points is None:
         point = getattr(info, "point", 0.0) if info is not None else 0.0
         spread_points = spread / point if point else None
-    confidence = float(proba[signal]) if signal > 0 else float(max(proba[1], proba[2]))
+    confidence = None if market_blocked else float(proba[signal]) if signal > 0 else float(max(proba[1], proba[2]))
     snapshot = LiveSnapshot(
         symbol=symbol,
         mt5_symbol=mt5_symbol,
@@ -446,6 +518,9 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> LiveSnapshot:
             spread_points=float(spread_points) if spread_points is not None else None,
             atr=float(latest["atr_14"]),
             last_candle_time=str(feature_time),
+            status=market.status,
+            status_reason=market.reason,
+            last_candle_age=market.last_candle_age_minutes,
         ),
         signal=SignalSnapshot(
             side=side,
@@ -487,6 +562,10 @@ def evaluate_symbol(mt5, symbol: str, trade: bool) -> LiveSnapshot:
             "gate_status": live_meta.get("gate_status", "missing"),
             "allowed_sides": "|".join(thresholds.get("allowed_sides", [])),
             "feature_time": str(feature_time),
+            "market_status": market.status,
+            "market_reason": market.reason,
+            "last_candle_age_minutes": market.last_candle_age_minutes,
+            "tick_age_minutes": market.tick_age_minutes,
         },
     )
 

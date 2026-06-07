@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,10 +19,10 @@ from calibration_utils import calibrate_prefit_classifier
 from backtest_diagnostics import build_threshold_fingerprint, signal_diagnostics, threshold_fingerprint_status
 from features import add_features
 from labeling import label_diagnostics, atr_barrier_labels
-from label_selection_experiment import LabelVariant, label_variant_frame, rank_results
+from label_selection_experiment import LabelVariant, is_label_cycle_complete, label_variant_frame, rank_results
 from analyze_live_signals import session_from_hour
 from live_dashboard import ASCII_BANNER, LiveSnapshot, RichDashboard, account_snapshot, positions_snapshot, trend_snapshot
-from live_mt5 import build_parser, decide_live_signal, evaluate_symbol, load_artifacts, order_dedupe_key, predict_proba_model, validate_trade_account
+from live_mt5 import build_parser, decide_live_signal, evaluate_symbol, load_artifacts, market_state, order_dedupe_key, predict_proba_model, validate_trade_account
 from risk import calculate_atr_sl_tp, check_spread_filter, normalize_lot
 from strategy_filters import session_allowed, simulate_exit
 from train import sample_weights
@@ -519,6 +520,162 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertIn(ASCII_BANNER.splitlines()[0], str(header.renderable))
         self.assertIn("[XAUUSD M5 | Machine Learning Live Engine]", str(header.renderable))
 
+    def test_market_state_open_with_fresh_candle_and_tick(self):
+        now = datetime(2026, 6, 7, 14, 0, 0)
+
+        class Info:
+            trade_mode = 4
+
+        class Tick:
+            time = int((now - timedelta(minutes=1)).timestamp())
+
+        class Mt5:
+            SYMBOL_TRADE_MODE_DISABLED = 0
+            SYMBOL_TRADE_MODE_CLOSEONLY = 1
+
+        state = market_state(Mt5(), "XAUUSD", Info(), Tick(), now - timedelta(minutes=5), "M5", now=now)
+
+        self.assertEqual(state.status, "OPEN")
+        self.assertEqual(state.reason, "OK")
+        self.assertAlmostEqual(state.last_candle_age_minutes, 5.0)
+        self.assertAlmostEqual(state.tick_age_minutes, 1.0)
+
+    def test_market_state_closes_on_stale_candle(self):
+        now = datetime(2026, 6, 7, 14, 0, 0)
+
+        class Info:
+            trade_mode = 4
+
+        class Tick:
+            time = int(now.timestamp())
+
+        class Mt5:
+            SYMBOL_TRADE_MODE_DISABLED = 0
+            SYMBOL_TRADE_MODE_CLOSEONLY = 1
+
+        state = market_state(Mt5(), "XAUUSD", Info(), Tick(), now - timedelta(minutes=31), "M5", now=now)
+
+        self.assertEqual(state.status, "CLOSED")
+        self.assertEqual(state.reason, "MARKET_CLOSED")
+
+    def test_market_state_closes_on_broker_trade_mode(self):
+        now = datetime(2026, 6, 7, 14, 0, 0)
+
+        class Info:
+            trade_mode = 1
+
+        class Tick:
+            time = int(now.timestamp())
+
+        class Mt5:
+            SYMBOL_TRADE_MODE_DISABLED = 0
+            SYMBOL_TRADE_MODE_CLOSEONLY = 1
+
+        state = market_state(Mt5(), "XAUUSD", Info(), Tick(), now - timedelta(minutes=5), "M5", now=now)
+
+        self.assertEqual(state.status, "CLOSED")
+        self.assertEqual(state.reason, "MARKET_CLOSED")
+
+    def test_market_state_unknown_without_tick(self):
+        now = datetime(2026, 6, 7, 14, 0, 0)
+
+        class Info:
+            trade_mode = 4
+
+        class Mt5:
+            SYMBOL_TRADE_MODE_DISABLED = 0
+            SYMBOL_TRADE_MODE_CLOSEONLY = 1
+
+        state = market_state(Mt5(), "XAUUSD", Info(), None, now - timedelta(minutes=5), "M5", now=now)
+
+        self.assertEqual(state.status, "UNKNOWN")
+        self.assertEqual(state.reason, "NO_TICK")
+
+    def test_live_dashboard_market_panel_shows_market_status(self):
+        dashboard = RichDashboard("XAUUSD", ["XAUUSD"])
+        snapshot = LiveSnapshot(
+            symbol="XAUUSD",
+            mt5_symbol="XAUUSD",
+            mode="DRY-RUN",
+            strategy="ML",
+            htf="ON",
+            connected=True,
+            heartbeat="OK",
+            trade_allowed="NO",
+            updated="14:05:00",
+        )
+        snapshot.market.status = "CLOSED"
+        snapshot.market.status_reason = "MARKET_CLOSED"
+        snapshot.market.last_candle_age = 2880.0
+
+        panel = dashboard._market(snapshot)
+        from rich.console import Console
+        console = Console(width=100)
+        with console.capture() as capture:
+            console.print(panel)
+        rendered = capture.get()
+
+        self.assertIn("Status", rendered)
+        self.assertIn("CLOSED", rendered)
+        self.assertIn("MARKET_CLOSED", rendered)
+
+    def test_live_dashboard_suppresses_signal_events_when_market_closed(self):
+        dashboard = RichDashboard("XAUUSD", ["XAUUSD"])
+        snapshot = LiveSnapshot(
+            symbol="XAUUSD",
+            mt5_symbol="XAUUSD",
+            mode="DRY-RUN",
+            strategy="ML",
+            htf="ON",
+            connected=True,
+            heartbeat="OK",
+            trade_allowed="NO",
+            updated="14:05:00",
+        )
+        snapshot.market.status = "CLOSED"
+        snapshot.market.status_reason = "MARKET_CLOSED"
+        snapshot.signal.side = "NO_TRADE"
+        snapshot.signal.reason = "MARKET_CLOSED"
+        snapshot.signal.prob_buy = 0.80
+        snapshot.signal.prob_sell = 0.20
+
+        dashboard.set_snapshot(snapshot)
+
+        self.assertEqual(list(dashboard.signal_events), [])
+        self.assertIn("MARKET_CLOSED", dashboard.main_events[-1])
+
+    def test_live_dashboard_places_trades_below_open_positions(self):
+        dashboard = RichDashboard("XAUUSD", ["XAUUSD"])
+
+        layout = dashboard._layout()
+
+        self.assertEqual([child.name for child in layout["middle"].children], ["positions", "trades"])
+        self.assertEqual(layout["positions"].ratio, 2)
+        self.assertEqual(layout["trades"].ratio, 3)
+        self.assertEqual(str(layout["positions"].renderable.title), "Open Positions")
+        self.assertEqual(str(layout["trades"].renderable.title), "Trades")
+
+    def test_live_dashboard_logs_row_excludes_trades_panel(self):
+        dashboard = RichDashboard("XAUUSD", ["XAUUSD"])
+
+        layout = dashboard._layout()
+        log_titles = [str(child.renderable.title) for child in layout["logs"].children]
+
+        self.assertEqual(log_titles, ["Main", "Signals", "Errors"])
+
+    def test_live_dashboard_event_panel_renders_latest_fixed_lines(self):
+        dashboard = RichDashboard("XAUUSD", ["XAUUSD"])
+        for index in range(8):
+            dashboard.main_events.append(f"event-{index}")
+
+        panel = dashboard._events_panel("Main", dashboard.main_events, "blue", max_lines=3)
+
+        rendered = panel.renderable.plain
+        self.assertNotIn("event-4", rendered)
+        self.assertIn("event-5", rendered)
+        self.assertIn("event-6", rendered)
+        self.assertIn("event-7", rendered)
+
     def test_disabled_symbol_does_not_send_order(self):
         class Info:
             volume_min = 0.01
@@ -594,7 +751,7 @@ class CoreBehaviorTests(unittest.TestCase):
             def history_deals_get(self, _start, _end):
                 return []
 
-        feature_time = pd.Timestamp("2026-06-06 03:50:00")
+        feature_time = pd.Timestamp.now().floor("min")
         features = pd.DataFrame(
             [{
                 "time": feature_time,
@@ -635,6 +792,154 @@ class CoreBehaviorTests(unittest.TestCase):
         self.assertEqual(snapshot.signal.reason, "DUPLICATE_ORDER_GUARD")
         self.assertAlmostEqual(snapshot.signal.confidence, 0.8)
         self.assertEqual(snapshot.trend["M5"], "UP")
+
+    def test_live_market_closed_blocks_order_and_updates_snapshot(self):
+        class Info:
+            volume_min = 0.01
+            volume_max = 1.0
+            volume_step = 0.01
+            trade_tick_value = 1.0
+            trade_tick_size = 0.01
+            trade_stops_level = 0
+            point = 0.01
+            trade_mode = 4
+
+        class Tick:
+            ask = 101.0
+            bid = 100.0
+            time = int(datetime.now().timestamp())
+
+        class Mt5:
+            SYMBOL_TRADE_MODE_DISABLED = 0
+            SYMBOL_TRADE_MODE_CLOSEONLY = 1
+
+            def symbol_info(self, _symbol):
+                return Info()
+
+            def symbol_info_tick(self, _symbol):
+                return Tick()
+
+            def positions_get(self):
+                return []
+
+            def history_deals_get(self, _start, _end):
+                return []
+
+        feature_time = pd.Timestamp.now() - pd.Timedelta(minutes=45)
+        features = pd.DataFrame(
+            [{
+                "time": feature_time,
+                "close": 100.0,
+                "atr_14": 2.0,
+                "spread": 1.0,
+                "spread_points": 100.0,
+                "spread_to_atr": 0.01,
+                "is_london_session": 1,
+                "ema_20": 99.0,
+            }]
+        )
+        side_model = {
+            "side_training_mode": "separate",
+            "models": {
+                "BUY": DummyModel([0.2, 0.8]),
+                "SELL": DummyModel([0.9, 0.1]),
+            },
+        }
+        from config import SYMBOLS as CONFIG_SYMBOLS
+        live_symbols = {key: value.copy() for key, value in CONFIG_SYMBOLS.items()}
+        live_symbols["XAUUSD"]["enabled_for_live"] = True
+
+        with patch("live_mt5.ensure_symbol_visible"), \
+             patch("live_mt5.SYMBOLS", live_symbols), \
+             patch("live_mt5.load_artifacts", return_value=(side_model, ["close", "atr_14", "spread_to_atr"], {"buy_threshold": 0.55, "sell_threshold": 0.55, "eligible": True, "_live_meta": {"gate_status": "passed"}})), \
+             patch("live_mt5.fetch_recent_candles", return_value=pd.DataFrame({"time": [feature_time], "close": [100.0]})), \
+             patch("live_mt5.add_features", return_value=features), \
+             patch("live_mt5.load_live_state", return_value={"last_orders": {}, "daily": {}}), \
+             patch("live_mt5.append_csv_row") as append_row, \
+             patch("live_mt5.send_order") as send_order:
+            snapshot = evaluate_symbol(Mt5(), "XAUUSD", trade=True)
+
+        self.assertFalse(send_order.called)
+        self.assertEqual(append_row.call_args.args[1]["reason"], "MARKET_CLOSED")
+        self.assertEqual(append_row.call_args.args[1]["signal"], "NO_TRADE")
+        self.assertEqual(append_row.call_args.args[1]["market_status"], "CLOSED")
+        self.assertEqual(append_row.call_args.args[1]["market_reason"], "MARKET_CLOSED")
+        self.assertEqual(snapshot.trade_allowed, "NO")
+        self.assertEqual(snapshot.market.status, "CLOSED")
+        self.assertEqual(snapshot.signal.side, "NO_TRADE")
+        self.assertEqual(snapshot.signal.reason, "MARKET_CLOSED")
+        self.assertEqual(snapshot.signal.confidence, None)
+
+    def test_live_missing_tick_blocks_order_and_updates_snapshot(self):
+        class Info:
+            volume_min = 0.01
+            volume_max = 1.0
+            volume_step = 0.01
+            trade_tick_value = 1.0
+            trade_tick_size = 0.01
+            trade_stops_level = 0
+            point = 0.01
+            trade_mode = 4
+
+        class Mt5:
+            SYMBOL_TRADE_MODE_DISABLED = 0
+            SYMBOL_TRADE_MODE_CLOSEONLY = 1
+
+            def symbol_info(self, _symbol):
+                return Info()
+
+            def symbol_info_tick(self, _symbol):
+                return None
+
+            def positions_get(self):
+                return []
+
+            def history_deals_get(self, _start, _end):
+                return []
+
+        feature_time = pd.Timestamp.now().floor("min")
+        features = pd.DataFrame(
+            [{
+                "time": feature_time,
+                "close": 100.0,
+                "atr_14": 2.0,
+                "spread": 1.0,
+                "spread_points": 100.0,
+                "spread_to_atr": 0.01,
+                "is_london_session": 1,
+                "ema_20": 99.0,
+            }]
+        )
+        side_model = {
+            "side_training_mode": "separate",
+            "models": {
+                "BUY": DummyModel([0.2, 0.8]),
+                "SELL": DummyModel([0.9, 0.1]),
+            },
+        }
+        from config import SYMBOLS as CONFIG_SYMBOLS
+        live_symbols = {key: value.copy() for key, value in CONFIG_SYMBOLS.items()}
+        live_symbols["XAUUSD"]["enabled_for_live"] = True
+
+        with patch("live_mt5.ensure_symbol_visible"), \
+             patch("live_mt5.SYMBOLS", live_symbols), \
+             patch("live_mt5.load_artifacts", return_value=(side_model, ["close", "atr_14", "spread_to_atr"], {"buy_threshold": 0.55, "sell_threshold": 0.55, "eligible": True, "_live_meta": {"gate_status": "passed"}})), \
+             patch("live_mt5.fetch_recent_candles", return_value=pd.DataFrame({"time": [feature_time], "close": [100.0]})), \
+             patch("live_mt5.add_features", return_value=features), \
+             patch("live_mt5.load_live_state", return_value={"last_orders": {}, "daily": {}}), \
+             patch("live_mt5.append_csv_row") as append_row, \
+             patch("live_mt5.send_order") as send_order:
+            snapshot = evaluate_symbol(Mt5(), "XAUUSD", trade=True)
+
+        self.assertFalse(send_order.called)
+        self.assertEqual(append_row.call_args.args[1]["reason"], "NO_TICK")
+        self.assertEqual(append_row.call_args.args[1]["signal"], "NO_TRADE")
+        self.assertEqual(append_row.call_args.args[1]["market_status"], "UNKNOWN")
+        self.assertEqual(snapshot.trade_allowed, "NO")
+        self.assertEqual(snapshot.market.status, "UNKNOWN")
+        self.assertEqual(snapshot.signal.side, "NO_TRADE")
+        self.assertEqual(snapshot.signal.reason, "NO_TICK")
+        self.assertEqual(snapshot.signal.confidence, None)
 
     def test_live_regime_filter_blocks_order(self):
         class Info:
@@ -711,6 +1016,20 @@ class CoreBehaviorTests(unittest.TestCase):
             self.assertFalse(is_cycle_complete(model_dir, report_dir))
             (report_dir / "oos_backtest.csv").write_text("", encoding="utf-8")
             self.assertTrue(is_cycle_complete(model_dir, report_dir))
+
+    def test_label_cycle_complete_uses_label_selection_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "model"
+            report_dir = Path(tmp) / "report"
+            model_dir.mkdir()
+            report_dir.mkdir()
+            self.assertFalse(is_label_cycle_complete(model_dir, report_dir))
+            for name in ["cycle_meta.json", "model.joblib", "feature_columns.json", "best_threshold.json"]:
+                (model_dir / name).write_text("{}", encoding="utf-8")
+            (report_dir / "oos_metrics.json").write_text("{}", encoding="utf-8")
+            self.assertFalse(is_label_cycle_complete(model_dir, report_dir))
+            (report_dir / "oos_backtest.csv").write_text("", encoding="utf-8")
+            self.assertTrue(is_label_cycle_complete(model_dir, report_dir))
 
     def test_walk_forward_output_paths_are_separated_by_tuning_mode(self):
         non_tuned = walk_forward_output_paths("USTEC_X100", 0)
