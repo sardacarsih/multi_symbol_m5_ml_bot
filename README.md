@@ -38,6 +38,18 @@ Jangan gunakan modal live sampai hasil forward test/demo sesuai dengan asumsi ba
 - Persistent live state untuk cooldown dan duplicate-order protection.
 - Laporan data quality dan integritas artifact.
 
+## Live Dashboard
+
+![TradingBotML live dashboard](docs/images/live-dashboard-preview.svg)
+
+Dashboard terminal menampilkan status koneksi MT5, akun, market, trend multi-timeframe, sinyal ML, posisi terbuka, dan event log live dalam satu tampilan.
+
+Jalankan dashboard live dry-run:
+
+```powershell
+python src/live_mt5.py --all --dashboard
+```
+
 ## Struktur Repository
 
 ```text
